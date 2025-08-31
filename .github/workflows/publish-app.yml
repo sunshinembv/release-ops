@@ -166,13 +166,27 @@ jobs:
             echo "… Variable NOTION_DB_RELEASES is empty in release-ops — skipping"
           fi
 
-      - name: Summary
+      - name: Set secrets (LLM) IF PRESENT
+        env:
+          GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
+          TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
         run: |
-          {
-            echo "### Bootstrapped secrets/variables for ${{ needs.publish.outputs.repo_fullname }}"
-            echo "- Repo: ${{ needs.publish.outputs.repo_html_url }}"
-            echo "- Notion: secret \`NOTION_TOKEN\` $( [ -n "${{ secrets.NOTION_TOKEN }}" ] && echo "✅" || echo "⛔" )"
-            echo "- Notion DB: var \`NOTION_DB_RELEASES\` $( [ -n "${{ vars.NOTION_DB_RELEASES }}" ] && echo "✅" || echo "⛔" )"
-            echo "- Android signing: KEYSTORE_* $( [ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && echo "✅ (present)" || echo "⛔ (skipped)" )"
-            echo "- Play JSON: $( [ -n "${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}" ] && echo "✅" || echo "⛔" )"
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if [ -n "${OPEN_ROUTER_API_KEY:-}" ]; then
+            echo -n "$OPEN_ROUTER_API_KEY" | gh secret set OPEN_ROUTER_API_KEY -R "$TARGET_REPO" -b-
+            echo "✓ Secret OPEN_ROUTER_API_KEY set"
+          else
+            echo "… OPEN_ROUTER_API_KEY missing in release-ops — skipping"
+          fi
+          
+          - name: Summary
+            run: |
+              {
+                echo "### Bootstrapped secrets/variables for ${{ needs.publish.outputs.repo_fullname }}"
+                echo "- Repo: ${{ needs.publish.outputs.repo_html_url }}"
+                echo "- Notion: secret \`NOTION_TOKEN\` $( [ -n "${{ secrets.NOTION_TOKEN }}" ] && echo "✅" || echo "⛔" )"
+                echo "- Notion DB: var \`NOTION_DB_RELEASES\` $( [ -n "${{ vars.NOTION_DB_RELEASES }}" ] && echo "✅" || echo "⛔" )"
+                echo "- Android signing: KEYSTORE_* $( [ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && echo "✅ (present)" || echo "⛔ (skipped)" )"
+                echo "- Play JSON: $( [ -n "${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}" ] && echo "✅" || echo "⛔" )"
+              } >> "$GITHUB_STEP_SUMMARY"
