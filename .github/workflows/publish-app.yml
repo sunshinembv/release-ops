@@ -119,6 +119,10 @@ jobs:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
+          
+          # длина в release-ops ДО очистки (после обрезки CR/LF, но без «жёсткой» чистки)
+          SRC_LEN=$(printf '%s' "$OPEN_ROUTER_API_KEY_SRC" | tr -d '\r\n' | wc -c)
+          echo "Source OPEN_ROUTER_API_KEY length (before sanitize): $SRC_LEN" >> "$GITHUB_STEP_SUMMARY"
 
           # Жёсткая чистка для однострочных токенов (API-ключи, Notion): убираем CR/LF/zero-width/любой unicode-space по всему значению + обрезаем кавычки по краям
           sanitize_token() {
@@ -144,14 +148,19 @@ jobs:
             fi
           }
 
+          # «отпечаток» после нашей sanitize_token (не раскрывает секрет)
+          SRC_FPRINT=$(printf '%s' "$OPEN_ROUTER_API_KEY_SRC" | sanitize_token | sha256sum | cut -c1-8)
+          echo "Source OPEN_ROUTER_API_KEY fingerprint: $SRC_FPRINT" >> "$GITHUB_STEP_SUMMARY"
+
           set_secret_token () { # name, raw_value -> sanitize_token
             local n="$1"; local raw="${2-}"
             if [ -n "$raw" ]; then
               clean="$(printf '%s' "$raw" | sanitize_token)"
               len="$(printf '%s' "$clean" | wc -c)"
+              fp="$(printf '%s' "$clean" | sha256sum | cut -c1-8)"
               if [ "$len" -lt 10 ]; then echo "❌ Secret $n too short after sanitize (len=$len)"; exit 1; fi
               printf '%s' "$clean" | gh secret set "$n" -R "$TARGET_REPO" -b-
-              echo "✓ Secret $n set (token, len=$len)"
+              echo "✓ Secret $n set (token, len=$len, fp=$fp)"
             else
               echo "… $n not set in release-ops — skipping"
             fi
