@@ -1,4 +1,4 @@
-name: Publish App to GitHub
+name: Publish App (create from template + bootstrap)
 
 on:
   workflow_dispatch:
@@ -55,7 +55,6 @@ jobs:
           TEMPLATE_REPO: ${{ github.event.inputs.template_repo }}
         run: |
           set -euo pipefail
-
           if [ -z "${GH_REPO_PAT:-}" ]; then
             echo "❌ Secret GH_REPO_PAT не задан"; exit 1
           fi
@@ -102,7 +101,7 @@ jobs:
       - name: Ensure gh CLI
         run: |
           if ! command -v gh >/dev/null 2>&1; then
-            type -p apt >/dev/null 2>&1 && sudo apt-get update && sudo apt-get install -y gh
+            sudo apt-get update && sudo apt-get install -y gh
           fi
           gh --version
 
@@ -111,82 +110,75 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
         run: gh auth status || true
 
-      - name: Set secrets (Notion + Android signing + Play) IF PRESENT
+      # ---- Секреты: LLM + Notion + Android signing + Play ----
+      - name: Set secrets (LLM/Notion/Signing/Play) IF PRESENT
         env:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
           TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
-
+          # LLM
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
           # Notion
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-
           # Android signing (optional)
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-
-          # Play service account (optional)
+          # Play (optional)
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
-
-          set_secret_if_present () {
-            local name="$1"
-            local val="$2"
-            if [ -n "$val" ]; then
-              echo -n "$val" | gh secret set "$name" -R "$TARGET_REPO" -b-
-              echo "✓ Secret $name set"
+          set_secret () { # name, value
+            local n="$1"; local v="${2:-}"
+            if [ -n "$v" ]; then
+              echo -n "$v" | gh secret set "$n" -R "$TARGET_REPO" -b-
+              echo "✓ Secret $n set"
             else
-              echo "… Secret $name is empty in release-ops — skipping"
+              echo "… $n not set in release-ops — skipping"
             fi
           }
 
-          set_secret_if_present NOTION_TOKEN "$NOTION_TOKEN"
+          set_secret OPEN_ROUTER_API_KEY "$OPEN_ROUTER_API_KEY"
+          set_secret NOTION_TOKEN "$NOTION_TOKEN"
+          set_secret KEYSTORE_BASE64 "$KEYSTORE_BASE64"
+          set_secret KEYSTORE_PASSWORD "$KEYSTORE_PASSWORD"
+          set_secret KEY_ALIAS "$KEY_ALIAS"
+          set_secret KEY_PASSWORD "$KEY_PASSWORD"
+          set_secret PLAY_SERVICE_ACCOUNT_JSON "$PLAY_SERVICE_ACCOUNT_JSON"
 
-          # Android signing (optional)
-          set_secret_if_present KEYSTORE_BASE64 "$KEYSTORE_BASE64"
-          set_secret_if_present KEYSTORE_PASSWORD "$KEYSTORE_PASSWORD"
-          set_secret_if_present KEY_ALIAS "$KEY_ALIAS"
-          set_secret_if_present KEY_PASSWORD "$KEY_PASSWORD"
-
-          # Play (optional)
-          set_secret_if_present PLAY_SERVICE_ACCOUNT_JSON "$PLAY_SERVICE_ACCOUNT_JSON"
-
-      - name: Set variables (Notion DB id) IF PRESENT
+      # ---- Переменные: Notion DB + LLM_MODEL ----
+      - name: Set variables (LLM_MODEL + NOTION_DB_RELEASES)
         env:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
           TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
           NOTION_DB_RELEASES: ${{ vars.NOTION_DB_RELEASES }}
+          LLM_MODEL_FROM_RELEASE_OPS: ${{ vars.LLM_MODEL }}
         run: |
           set -euo pipefail
+          # Notion DB id
           if [ -n "${NOTION_DB_RELEASES:-}" ]; then
             gh variable set NOTION_DB_RELEASES -R "$TARGET_REPO" --body "$NOTION_DB_RELEASES"
             echo "✓ Variable NOTION_DB_RELEASES set"
           else
-            echo "… Variable NOTION_DB_RELEASES is empty in release-ops — skipping"
+            echo "… Variable NOTION_DB_RELEASES not set in release-ops — skipping"
           fi
 
-      - name: Set secrets (LLM) IF PRESENT
-        env:
-          GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
-          TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
-          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          # LLM_MODEL — берём из release-ops vars, иначе дефолт на бесплатную
+          LLM_VALUE="${LLM_MODEL_FROM_RELEASE_OPS:-deepseek/deepseek-chat-v3-0324:free}"
+          gh variable set LLM_MODEL -R "$TARGET_REPO" --body "$LLM_VALUE"
+          echo "✓ Variable LLM_MODEL set to '$LLM_VALUE'"
+
+      - name: Summary
         run: |
-          set -euo pipefail
-          if [ -n "${OPEN_ROUTER_API_KEY:-}" ]; then
-            echo -n "$OPEN_ROUTER_API_KEY" | gh secret set OPEN_ROUTER_API_KEY -R "$TARGET_REPO" -b-
-            echo "✓ Secret OPEN_ROUTER_API_KEY set"
-          else
-            echo "… OPEN_ROUTER_API_KEY missing in release-ops — skipping"
-          fi
-          
-          - name: Summary
-            run: |
-              {
-                echo "### Bootstrapped secrets/variables for ${{ needs.publish.outputs.repo_fullname }}"
-                echo "- Repo: ${{ needs.publish.outputs.repo_html_url }}"
-                echo "- Notion: secret \`NOTION_TOKEN\` $( [ -n "${{ secrets.NOTION_TOKEN }}" ] && echo "✅" || echo "⛔" )"
-                echo "- Notion DB: var \`NOTION_DB_RELEASES\` $( [ -n "${{ vars.NOTION_DB_RELEASES }}" ] && echo "✅" || echo "⛔" )"
-                echo "- Android signing: KEYSTORE_* $( [ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && echo "✅ (present)" || echo "⛔ (skipped)" )"
-                echo "- Play JSON: $( [ -n "${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}" ] && echo "✅" || echo "⛔" )"
-              } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Bootstrapped to ${{ needs.publish.outputs.repo_fullname }}"
+            echo "- Repo: ${{ needs.publish.outputs.repo_html_url }}"
+            echo "- Secrets:"
+            echo "  - OPEN_ROUTER_API_KEY: $([ -n "${{ secrets.OPEN_ROUTER_API_KEY }}" ] && echo "✅" || echo "⛔")"
+            echo "  - NOTION_TOKEN:       $([ -n "${{ secrets.NOTION_TOKEN }}" ] && echo "✅" || echo "⛔")"
+            echo "  - KEYSTORE_*:         $([ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && echo "✅" || echo "⛔")"
+            echo "  - PLAY JSON:          $([ -n "${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}" ] && echo "✅" || echo "⛔")"
+            echo "- Variables:"
+            echo "  - NOTION_DB_RELEASES: $([ -n "${{ vars.NOTION_DB_RELEASES }}" ] && echo "✅" || echo "⛔")"
+            echo "  - LLM_MODEL:          '${{ vars.LLM_MODEL || 'deepseek/deepseek-chat-v3-0324:free' }}'"
+          } >> "$GITHUB_STEP_SUMMARY"
