@@ -119,12 +119,8 @@ jobs:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
-          
-          # длина в release-ops ДО очистки (после обрезки CR/LF, но без «жёсткой» чистки)
-          SRC_LEN=$(printf '%s' "$OPEN_ROUTER_API_KEY_SRC" | tr -d '\r\n' | wc -c)
-          echo "Source OPEN_ROUTER_API_KEY length (before sanitize): $SRC_LEN" >> "$GITHUB_STEP_SUMMARY"
 
-          # Жёсткая чистка для однострочных токенов (API-ключи, Notion): убираем CR/LF/zero-width/любой unicode-space по всему значению + обрезаем кавычки по краям
+          # Жёсткая чистка для однострочных токенов (API-ключи)
           sanitize_token() {
             cleaned="$(cat | tr -d '\r\n' \
               | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//' \
@@ -132,25 +128,11 @@ jobs:
             printf '%s' "$cleaned"
           }
 
-          # Мягкая чистка для простых строк (пароли/алиасы): убираем CR/LF и трим края; ВНУТРЕННИЕ пробелы оставляем
+          # Мягкая чистка для простых строк (пароли/алиасы)
           sanitize_line() {
             cleaned="$(cat | tr -d '\r\n' | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//')"
             printf '%s' "$cleaned"
           }
-
-          set_secret_raw () { # name, raw_value (без модификаций: JSON/BASE64)
-            local n="$1"; local raw="${2-}"
-            if [ -n "$raw" ]; then
-              printf '%s' "$raw" | gh secret set "$n" -R "$TARGET_REPO" -b-
-              echo "✓ Secret $n set (raw, len=$(printf '%s' "$raw" | wc -c))"
-            else
-              echo "… $n not set in release-ops — skipping"
-            fi
-          }
-
-          # «отпечаток» после нашей sanitize_token (не раскрывает секрет)
-          SRC_FPRINT=$(printf '%s' "$OPEN_ROUTER_API_KEY_SRC" | sanitize_token | sha256sum | cut -c1-8)
-          echo "Source OPEN_ROUTER_API_KEY fingerprint: $SRC_FPRINT" >> "$GITHUB_STEP_SUMMARY"
 
           set_secret_token () { # name, raw_value -> sanitize_token
             local n="$1"; local raw="${2-}"
@@ -159,7 +141,7 @@ jobs:
               len="$(printf '%s' "$clean" | wc -c)"
               fp="$(printf '%s' "$clean" | sha256sum | cut -c1-8)"
               if [ "$len" -lt 10 ]; then echo "❌ Secret $n too short after sanitize (len=$len)"; exit 1; fi
-              printf '%s' "$clean" | gh secret set "$n" -R "$TARGET_REPO" -b-
+              gh secret set "$n" -R "$TARGET_REPO" --body "$clean"
               echo "✓ Secret $n set (token, len=$len, fp=$fp)"
             else
               echo "… $n not set in release-ops — skipping"
@@ -170,8 +152,18 @@ jobs:
             local n="$1"; local raw="${2-}"
             if [ -n "$raw" ]; then
               clean="$(printf '%s' "$raw" | sanitize_line)"
-              printf '%s' "$clean" | gh secret set "$n" -R "$TARGET_REPO" -b-
+              gh secret set "$n" -R "$TARGET_REPO" --body "$clean"
               echo "✓ Secret $n set (line, len=$(printf '%s' "$clean" | wc -c))"
+            else
+              echo "… $n not set in release-ops — skipping"
+            fi
+          }
+
+          set_secret_raw () { # name, raw_value (JSON/BASE64 — как есть)
+            local n="$1"; local raw="${2-}"
+            if [ -n "$raw" ]; then
+              gh secret set "$n" -R "$TARGET_REPO" --body "$raw"
+              echo "✓ Secret $n set (raw, len=$(printf '%s' "$raw" | wc -c))"
             else
               echo "… $n not set in release-ops — skipping"
             fi
@@ -187,7 +179,6 @@ jobs:
           set_secret_line  KEY_PASSWORD "$KEY_PASSWORD"
 
           set_secret_raw   PLAY_SERVICE_ACCOUNT_JSON "$PLAY_SERVICE_ACCOUNT_JSON"
-
       - name: Set variables (LLM_MODEL + LLM_FALLBACKS + NOTION_DB_RELEASES)
         env:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
