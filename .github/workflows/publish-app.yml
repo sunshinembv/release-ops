@@ -58,27 +58,18 @@ jobs:
           if [ -z "${GH_REPO_PAT:-}" ]; then
             echo "❌ Secret GH_REPO_PAT не задан"; exit 1
           fi
-
-          # case-insensitive true/false
           case "${PRIVATE,,}" in
             true|1|yes|y) PRIV=true ;;
             *)            PRIV=false ;;
           esac
-
           RESP=$(curl -sS -X POST \
             -H "Authorization: Bearer ${GH_REPO_PAT}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${TEMPLATE_OWNER}/${TEMPLATE_REPO}/generate" \
-            -d "$(jq -n \
-                  --arg owner "$TARGET_OWNER" \
-                  --arg name "$REPO_NAME" \
-                  --arg desc "$DESCRIPTION" \
-                  --argjson priv $PRIV \
+            -d "$(jq -n --arg owner "$TARGET_OWNER" --arg name "$REPO_NAME" --arg desc "$DESCRIPTION" --argjson priv $PRIV \
                   '{owner:$owner,name:$name,description:$desc,private:$priv}')" )
-
           echo "$RESP" | jq . > /tmp/create.json || true
-
           if jq -e '.html_url' /tmp/create.json >/dev/null 2>&1; then
             HTML_URL=$(jq -r .html_url  /tmp/create.json)
             CLONE_URL=$(jq -r .clone_url /tmp/create.json)
@@ -111,35 +102,32 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
         run: gh auth status || true
 
-      # ---- Секреты: LLM + Notion + Android signing + Play ----
       - name: Set secrets (LLM/Notion/Signing/Play) IF PRESENT
         env:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
           TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
-          # LLM
           OPEN_ROUTER_API_KEY_SRC: ${{ secrets.OPEN_ROUTER_API_KEY }}
-          # Notion
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          # Android signing (optional)
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          # Play (optional)
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
-          set_secret () { # name, value
-            local n="$1"; local v="${2-}"
-            if [ -n "$v" ]; then
-              # строго без переводов строки
-              printf '%s' "$v" | gh secret set "$n" -R "$TARGET_REPO" -b-
-              echo "✓ Secret $n set"
+          sanitize_one_line() {
+            printf '%s' "${1-}" | tr -d '\r\n' | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//'
+          }
+          set_secret () { # name, raw_value
+            local n="$1"; local raw="${2-}"
+            if [ -n "$raw" ]; then
+              local clean; clean="$(sanitize_one_line "$raw")"
+              printf '%s' "$clean" | gh secret set "$n" -R "$TARGET_REPO" -b-
+              echo "✓ Secret $n set (len=$(printf '%s' "$clean" | wc -c))"
             else
               echo "… $n not set in release-ops — skipping"
             fi
           }
-
           set_secret OPEN_ROUTER_API_KEY "$OPEN_ROUTER_API_KEY_SRC"
           set_secret NOTION_TOKEN "$NOTION_TOKEN"
           set_secret KEYSTORE_BASE64 "$KEYSTORE_BASE64"
@@ -148,7 +136,6 @@ jobs:
           set_secret KEY_PASSWORD "$KEY_PASSWORD"
           set_secret PLAY_SERVICE_ACCOUNT_JSON "$PLAY_SERVICE_ACCOUNT_JSON"
 
-      # ---- Переменные: Notion DB + LLM_MODEL (+ опц. LLM_FALLBACKS) ----
       - name: Set variables (LLM_MODEL + LLM_FALLBACKS + NOTION_DB_RELEASES)
         env:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
@@ -158,23 +145,19 @@ jobs:
           LLM_FALLBACKS_FROM_RELEASE_OPS: ${{ vars.LLM_FALLBACKS }}
         run: |
           set -euo pipefail
-
           if [ -n "${NOTION_DB_RELEASES:-}" ]; then
             gh variable set NOTION_DB_RELEASES -R "$TARGET_REPO" --body "$NOTION_DB_RELEASES"
             echo "✓ Variable NOTION_DB_RELEASES set"
           else
             echo "… Variable NOTION_DB_RELEASES not set in release-ops — skipping"
           fi
-
           LLM_VALUE="${LLM_MODEL_FROM_RELEASE_OPS:-deepseek/deepseek-chat-v3-0324:free}"
           gh variable set LLM_MODEL -R "$TARGET_REPO" --body "$LLM_VALUE"
           echo "✓ Variable LLM_MODEL set to '$LLM_VALUE'"
-
           LLM_FB_VALUE="${LLM_FALLBACKS_FROM_RELEASE_OPS:-deepseek/deepseek-r1:free}"
           gh variable set LLM_FALLBACKS -R "$TARGET_REPO" --body "$LLM_FB_VALUE"
           echo "✓ Variable LLM_FALLBACKS set to '$LLM_FB_VALUE'"
 
-      # ---- Дым-тест секрета OpenRouter в новом репозитории ----
       - name: Detect default branch of target repo
         id: defbranch
         env:
@@ -207,9 +190,7 @@ jobs:
           DEFAULT_BRANCH: ${{ steps.defbranch.outputs.branch }}
         run: |
           set -euo pipefail
-          gh api -X POST \
-            repos/$TARGET_REPO/actions/workflows/openrouter-smoke.yml/dispatches \
-            -f ref="$DEFAULT_BRANCH"
+          gh api -X POST repos/$TARGET_REPO/actions/workflows/openrouter-smoke.yml/dispatches -f ref="$DEFAULT_BRANCH"
           echo "Smoke dispatched on $DEFAULT_BRANCH"
 
       - name: Wait for smoke run result (up to 2 min)
