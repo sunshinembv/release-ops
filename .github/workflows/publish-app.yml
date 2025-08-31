@@ -101,9 +101,10 @@ jobs:
       - name: Ensure gh CLI
         run: |
           if ! command -v gh >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y gh
+            sudo apt-get update && sudo apt-get install -y gh jq
           fi
           gh --version
+          jq --version
 
       - name: Configure auth for gh
         env:
@@ -116,7 +117,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
           TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
           # LLM
-          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          OPEN_ROUTER_API_KEY_SRC: ${{ secrets.OPEN_ROUTER_API_KEY }}
           # Notion
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           # Android signing (optional)
@@ -129,16 +130,17 @@ jobs:
         run: |
           set -euo pipefail
           set_secret () { # name, value
-            local n="$1"; local v="${2:-}"
+            local n="$1"; local v="${2-}"
             if [ -n "$v" ]; then
-              echo -n "$v" | gh secret set "$n" -R "$TARGET_REPO" -b-
+              # строго без переводов строки
+              printf '%s' "$v" | gh secret set "$n" -R "$TARGET_REPO" -b-
               echo "✓ Secret $n set"
             else
               echo "… $n not set in release-ops — skipping"
             fi
           }
 
-          set_secret OPEN_ROUTER_API_KEY "$OPEN_ROUTER_API_KEY"
+          set_secret OPEN_ROUTER_API_KEY "$OPEN_ROUTER_API_KEY_SRC"
           set_secret NOTION_TOKEN "$NOTION_TOKEN"
           set_secret KEYSTORE_BASE64 "$KEYSTORE_BASE64"
           set_secret KEYSTORE_PASSWORD "$KEYSTORE_PASSWORD"
@@ -146,16 +148,17 @@ jobs:
           set_secret KEY_PASSWORD "$KEY_PASSWORD"
           set_secret PLAY_SERVICE_ACCOUNT_JSON "$PLAY_SERVICE_ACCOUNT_JSON"
 
-      # ---- Переменные: Notion DB + LLM_MODEL ----
-      - name: Set variables (LLM_MODEL + NOTION_DB_RELEASES)
+      # ---- Переменные: Notion DB + LLM_MODEL (+ опц. LLM_FALLBACKS) ----
+      - name: Set variables (LLM_MODEL + LLM_FALLBACKS + NOTION_DB_RELEASES)
         env:
           GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
           TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
           NOTION_DB_RELEASES: ${{ vars.NOTION_DB_RELEASES }}
           LLM_MODEL_FROM_RELEASE_OPS: ${{ vars.LLM_MODEL }}
+          LLM_FALLBACKS_FROM_RELEASE_OPS: ${{ vars.LLM_FALLBACKS }}
         run: |
           set -euo pipefail
-          # Notion DB id
+
           if [ -n "${NOTION_DB_RELEASES:-}" ]; then
             gh variable set NOTION_DB_RELEASES -R "$TARGET_REPO" --body "$NOTION_DB_RELEASES"
             echo "✓ Variable NOTION_DB_RELEASES set"
@@ -163,22 +166,89 @@ jobs:
             echo "… Variable NOTION_DB_RELEASES not set in release-ops — skipping"
           fi
 
-          # LLM_MODEL — берём из release-ops vars, иначе дефолт на бесплатную
           LLM_VALUE="${LLM_MODEL_FROM_RELEASE_OPS:-deepseek/deepseek-chat-v3-0324:free}"
           gh variable set LLM_MODEL -R "$TARGET_REPO" --body "$LLM_VALUE"
           echo "✓ Variable LLM_MODEL set to '$LLM_VALUE'"
+
+          LLM_FB_VALUE="${LLM_FALLBACKS_FROM_RELEASE_OPS:-deepseek/deepseek-r1:free}"
+          gh variable set LLM_FALLBACKS -R "$TARGET_REPO" --body "$LLM_FB_VALUE"
+          echo "✓ Variable LLM_FALLBACKS set to '$LLM_FB_VALUE'"
+
+      # ---- Дым-тест секрета OpenRouter в новом репозитории ----
+      - name: Detect default branch of target repo
+        id: defbranch
+        env:
+          GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
+          TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
+        run: |
+          set -euo pipefail
+          BRANCH=$(gh api repos/$TARGET_REPO --jq .default_branch)
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Default branch: $BRANCH" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for workflow indexing (openrouter-smoke.yml)
+        env:
+          GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
+          TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if gh api repos/$TARGET_REPO/actions/workflows --jq '.workflows[].path' | grep -q '.github/workflows/openrouter-smoke.yml'; then
+              echo "Workflow openrouter-smoke.yml is available"; exit 0
+            fi
+            sleep 2
+          done
+          echo "⚠️ Workflow openrouter-smoke.yml not found yet"; exit 1
+
+      - name: Trigger OpenRouter smoke test in target repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
+          TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
+          DEFAULT_BRANCH: ${{ steps.defbranch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          gh api -X POST \
+            repos/$TARGET_REPO/actions/workflows/openrouter-smoke.yml/dispatches \
+            -f ref="$DEFAULT_BRANCH"
+          echo "Smoke dispatched on $DEFAULT_BRANCH"
+
+      - name: Wait for smoke run result (up to 2 min)
+        env:
+          GH_TOKEN: ${{ secrets.GH_REPO_PAT }}
+          TARGET_REPO: ${{ needs.publish.outputs.repo_fullname }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 24); do
+            sleep 5
+            RUN=$(gh api repos/$TARGET_REPO/actions/workflows/openrouter-smoke.yml/runs --jq '.workflow_runs[0]')
+            STATUS=$(jq -r '.status // empty' <<<"$RUN")
+            CONCL=$(jq -r '.conclusion // empty' <<<"$RUN")
+            URL=$(jq -r '.html_url // empty' <<<"$RUN")
+            echo "  status=$STATUS conclusion=$CONCL $URL"
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCL" = "success" ]; then
+                echo "✓ Smoke test passed: $URL"
+                exit 0
+              else
+                echo "❌ Smoke test failed: $URL"
+                exit 1
+              fi
+            fi
+          done
+          echo "⚠️ Smoke test did not finish in time"; exit 1
 
       - name: Summary
         run: |
           {
             echo "### Bootstrapped to ${{ needs.publish.outputs.repo_fullname }}"
             echo "- Repo: ${{ needs.publish.outputs.repo_html_url }}"
-            echo "- Secrets:"
+            echo "- Secrets set from release-ops:"
             echo "  - OPEN_ROUTER_API_KEY: $([ -n "${{ secrets.OPEN_ROUTER_API_KEY }}" ] && echo "✅" || echo "⛔")"
             echo "  - NOTION_TOKEN:       $([ -n "${{ secrets.NOTION_TOKEN }}" ] && echo "✅" || echo "⛔")"
             echo "  - KEYSTORE_*:         $([ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && echo "✅" || echo "⛔")"
             echo "  - PLAY JSON:          $([ -n "${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}" ] && echo "✅" || echo "⛔")"
-            echo "- Variables:"
+            echo "- Variables applied to target:"
             echo "  - NOTION_DB_RELEASES: $([ -n "${{ vars.NOTION_DB_RELEASES }}" ] && echo "✅" || echo "⛔")"
             echo "  - LLM_MODEL:          '${{ vars.LLM_MODEL || 'deepseek/deepseek-chat-v3-0324:free' }}'"
+            echo "  - LLM_FALLBACKS:      '${{ vars.LLM_FALLBACKS || 'deepseek/deepseek-r1:free' }}'"
           } >> "$GITHUB_STEP_SUMMARY"
